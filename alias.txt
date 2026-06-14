@@ -1,0 +1,2 @@
+foo-test.bar.local
+foo-tt.bar
