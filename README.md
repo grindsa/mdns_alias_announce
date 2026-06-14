@@ -16,7 +16,7 @@ It publishes custom `.local` hostnames from a text file and responds to mDNS que
 - Loads aliases from a file (ignores empty lines and comments beginning with `#`)
 - Normalizes names to `.local`
 - Auto-detects the primary local IPv4 interface and pins multicast traffic to it
-- Optional IPv6 support for AAAA answers on the same interface
+- Optional IPv6 support for AAAA answers, including IPv6 mDNS transport on the same interface
 - Verbose query/response diagnostics (`-Verbose`)
 - Optional transcript logging (`-LogToFile`)
 - Startup network profile self-check (warns for Public profile)
@@ -65,7 +65,7 @@ powershell -ExecutionPolicy Bypass -File C:\programdata\mdns_alias_announce\mdns
 ## Parameters
 
 - `-FilePath <string>`: alias input file path
-- `-IntervalSeconds <int>`: periodic announcement interval (default: `30`)
+- `-IntervalSeconds <int>`: periodic announcement interval in seconds (range: `1..86400`, default: `30`)
 - `-LogToFile`: enable transcript logging
 - `-LogFilePath <string>`: transcript destination path (default: `mdns_alias_announce.log` next to script)
 
@@ -160,6 +160,59 @@ Update task (replace existing):
 Unregister-ScheduledTask -TaskName "mDNS Alias Announcer" -Confirm:$false
 # Then run the Register-ScheduledTask block again
 ```
+
+## Startup Checklist
+
+Use this quick checklist after install or reboot:
+
+1. Confirm `aliases.txt` exists and contains at least one alias.
+2. Confirm UDP 5353 firewall rules are present for the network profile in use.
+3. Confirm the host is on a trusted LAN segment (same L2 domain / VLAN as clients).
+4. Start the script or scheduled task and watch startup output for selected interface/IP.
+5. Run one client-side lookup test (A/AAAA) before considering setup complete.
+
+Quick checks on Windows:
+
+```powershell
+Get-Content C:\programdata\mdns_alias_announce\aliases.txt
+Get-NetFirewallRule -DisplayName "mDNS Alias Responder *"
+Get-ScheduledTask -TaskName "mDNS Alias Announcer" | Get-ScheduledTaskInfo
+```
+
+## Known Limitations
+
+- This script is focused on host A/AAAA answers only (no PTR/SRV/TXT service discovery records).
+- IPv6 transport requires usable IPv6 on the selected interface; link-local-only (`fe80::/10`) addresses are ignored.
+- Multi-homed hosts can still have edge cases if the default route does not match the LAN where clients query.
+- This implementation does not perform mDNS conflict probing/defense logic before announcing names.
+- Network equipment with client isolation, strict multicast filtering, or cross-VLAN boundaries may block discovery.
+
+## Verification Workflow
+
+Use this sequence to validate behavior end-to-end.
+
+1. Start responder with verbose logging:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\programdata\mdns_alias_announce\mdns_alias_announce.ps1 -FilePath C:\programdata\mdns_alias_announce\aliases.txt -Verbose
+```
+
+2. Query from a client (macOS example):
+
+```bash
+dns-sd -G v4v6 testbox.local
+```
+
+3. Capture multicast traffic if results are inconsistent:
+
+```bash
+sudo tcpdump -ni en0 udp port 5353
+```
+
+Expected result:
+
+- Verbose logs show `match=True` for the queried name.
+- Client receives A response (and AAAA when usable IPv6 is configured).
 
 ## Troubleshooting
 

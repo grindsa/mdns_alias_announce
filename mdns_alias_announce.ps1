@@ -4,6 +4,7 @@ param (
     [string]$FilePath = "$PSScriptRoot\aliases.txt",
 
     [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 86400)]
     [int]$IntervalSeconds = 30,
 
     [Parameter(Mandatory = $false)]
@@ -65,6 +66,7 @@ foreach ($name in $CustomNames) {
 # Core mDNS Protocol Definitions
 # ---------------------------------------------------------------
 $mDNSAddress = [System.Net.IPAddress]::Parse("224.0.0.251")
+$mDNSv6Address = [System.Net.IPAddress]::Parse("ff02::fb")
 $mDNSPort    = 5353
 
 function Get-PrimaryIPv4Info {
@@ -342,6 +344,7 @@ function Get-ParsedQueries ([byte[]]$QueryPacket, [System.Collections.Generic.Ha
 # Main Announcement Loop
 # ---------------------------------------------------------------
 $UdpClient = [System.Net.Sockets.UdpClient]::new([System.Net.Sockets.AddressFamily]::InterNetwork)
+$UdpClientV6 = $null
 $UdpClient.ExclusiveAddressUse = $false
 # Enable Address Reuse so it doesn't conflict with Windows native mDNS
 $UdpClient.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
@@ -352,12 +355,95 @@ $UdpClient.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::IP, [S
 $UdpClient.JoinMulticastGroup($mDNSAddress, [System.Net.IPAddress]::Parse($LocalIP))
 $multicastInterfaceBytes = [System.Net.IPAddress]::Parse($LocalIP).GetAddressBytes()
 $UdpClient.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::IP, [System.Net.Sockets.SocketOptionName]::MulticastInterface, $multicastInterfaceBytes)
-$UdpClient.Client.ReceiveTimeout = 1000
+$UdpClient.Client.ReceiveTimeout = 500
 $EndPoint = New-Object System.Net.IPEndPoint ($mDNSAddress, $mDNSPort)
+$EndPointV6 = [System.Net.IPEndPoint]::new($mDNSv6Address, $mDNSPort)
+
+if ($LocalIPv6) {
+    try {
+        $UdpClientV6 = [System.Net.Sockets.UdpClient]::new([System.Net.Sockets.AddressFamily]::InterNetworkV6)
+        $UdpClientV6.ExclusiveAddressUse = $false
+        $UdpClientV6.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+        $UdpClientV6.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::IPv6Any, $mDNSPort))
+        # RFC 6762 requires link-local mDNS packets to use hop limit 255.
+        $UdpClientV6.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::IPv6, [System.Net.Sockets.SocketOptionName]::HopLimit, 255)
+        $UdpClientV6.JoinMulticastGroup($mDNSv6Address, $PrimaryIPv4.InterfaceIndex)
+        $UdpClientV6.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::IPv6, [System.Net.Sockets.SocketOptionName]::MulticastInterface, $PrimaryIPv4.InterfaceIndex)
+        $UdpClientV6.Client.ReceiveTimeout = 500
+        Write-Host "[+] IPv6 mDNS transport enabled on ff02::fb (Interface Index $($PrimaryIPv4.InterfaceIndex))" -ForegroundColor Green
+    }
+    catch {
+        $UdpClientV6 = $null
+        Write-Warning "[!] Failed to initialize IPv6 mDNS transport: $($_.Exception.Message)"
+    }
+}
+
+function Handle-IncomingQueryPacket (
+    [System.Net.Sockets.UdpClient]$Socket,
+    [byte[]]$QueryPacket,
+    [System.Net.IPEndPoint]$RemoteEndPoint,
+    [System.Net.IPEndPoint]$MulticastEndPoint,
+    [System.Collections.Generic.HashSet[string]]$PublishedSet,
+    [byte[]]$IPv4AddressBytes,
+    [byte[]]$IPv6AddressBytes
+) {
+    $parsedQueries = Get-ParsedQueries -QueryPacket $QueryPacket -PublishedSet $PublishedSet
+
+    foreach ($query in $parsedQueries) {
+        Write-Verbose ("mDNS query from {0}:{1} family={2} name={3} type=0x{4:X4} class=0x{5:X4} qu={6} match={7}" -f $RemoteEndPoint.Address, $RemoteEndPoint.Port, $RemoteEndPoint.AddressFamily, $query.Name, $query.QType, $query.QClass, $query.WantsUnicast, $query.IsMatch)
+    }
+
+    $responsesSent = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $matchedQueries = $parsedQueries | Where-Object { $_.IsMatch }
+
+    foreach ($match in $matchedQueries) {
+        $responseKey = "$($match.Name)|$($match.WantsUnicast)|$($match.QType)"
+        if (-not $responsesSent.Add($responseKey)) {
+            continue
+        }
+
+        $responses = [System.Collections.Generic.List[object]]::new()
+
+        if ($match.QType -eq 0x0001) {
+            $responses.Add([pscustomobject]@{ RecordType = 0x0001; AddressBytes = $IPv4AddressBytes; Label = 'A' })
+        }
+        elseif ($match.QType -eq 0x001C) {
+            if ($IPv6AddressBytes) {
+                $responses.Add([pscustomobject]@{ RecordType = 0x001C; AddressBytes = $IPv6AddressBytes; Label = 'AAAA' })
+            }
+            else {
+                Write-Verbose ("mDNS query requested AAAA but no IPv6 address is configured for {0}" -f $match.Name)
+            }
+        }
+        else {
+            # ANY query: return all available address families.
+            $responses.Add([pscustomobject]@{ RecordType = 0x0001; AddressBytes = $IPv4AddressBytes; Label = 'A' })
+            if ($IPv6AddressBytes) {
+                $responses.Add([pscustomobject]@{ RecordType = 0x001C; AddressBytes = $IPv6AddressBytes; Label = 'AAAA' })
+            }
+        }
+
+        foreach ($resp in $responses) {
+            $response = New-AnswerPacket -Name $match.Name -AddressBytes $resp.AddressBytes -RecordType $resp.RecordType
+
+            if ($match.WantsUnicast) {
+                $null = $Socket.Send($response, $response.Length, $RemoteEndPoint)
+                Write-Verbose ("mDNS response path=unicast target={0}:{1} family={2} name={3} type={4}" -f $RemoteEndPoint.Address, $RemoteEndPoint.Port, $RemoteEndPoint.AddressFamily, $match.Name, $resp.Label)
+                Write-Host "  -> Responded (unicast $($resp.Label)) for: $($match.Name) to $($RemoteEndPoint.Address):$($RemoteEndPoint.Port)" -ForegroundColor DarkGray
+            }
+            else {
+                $null = $Socket.Send($response, $response.Length, $MulticastEndPoint)
+                Write-Verbose ("mDNS response path=multicast target={0}:{1} family={2} name={3} type={4}" -f $MulticastEndPoint.Address, $MulticastEndPoint.Port, $MulticastEndPoint.AddressFamily, $match.Name, $resp.Label)
+                Write-Host "  -> Responded (multicast $($resp.Label)) for: $($match.Name)" -ForegroundColor DarkGray
+            }
+        }
+    }
+}
 
 try {
     $nextAnnouncement = Get-Date
-    $remoteEndPoint = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+    $remoteEndPointV4 = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+    $remoteEndPointV6 = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::IPv6Any, 0)
 
     while ($true) {
         $now = Get-Date
@@ -370,10 +456,20 @@ try {
                 $null = $UdpClient.Send($bufferA, $bufferA.Length, $EndPoint)
                 Write-Host "  -> Announced A: $name" -ForegroundColor Gray
 
+                if ($UdpClientV6) {
+                    $null = $UdpClientV6.Send($bufferA, $bufferA.Length, $EndPointV6)
+                    Write-Host "  -> Announced A (IPv6 mDNS transport): $name" -ForegroundColor Gray
+                }
+
                 if ($IPv6Bytes) {
                     $bufferAAAA = New-AnswerPacket -Name $name -AddressBytes $IPv6Bytes -RecordType 0x001C
                     $null = $UdpClient.Send($bufferAAAA, $bufferAAAA.Length, $EndPoint)
                     Write-Host "  -> Announced AAAA: $name" -ForegroundColor Gray
+
+                    if ($UdpClientV6) {
+                        $null = $UdpClientV6.Send($bufferAAAA, $bufferAAAA.Length, $EndPointV6)
+                        Write-Host "  -> Announced AAAA (IPv6 mDNS transport): $name" -ForegroundColor Gray
+                    }
                 }
             }
 
@@ -381,62 +477,24 @@ try {
         }
 
         try {
-            $queryPacket = $UdpClient.Receive([ref]$remoteEndPoint)
-            $parsedQueries = Get-ParsedQueries -QueryPacket $queryPacket -PublishedSet $PublishedNames
-
-            foreach ($query in $parsedQueries) {
-                Write-Verbose ("mDNS query from {0}:{1} name={2} type=0x{3:X4} class=0x{4:X4} qu={5} match={6}" -f $remoteEndPoint.Address, $remoteEndPoint.Port, $query.Name, $query.QType, $query.QClass, $query.WantsUnicast, $query.IsMatch)
-            }
-
-            $responsesSent = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            $matchedQueries = $parsedQueries | Where-Object { $_.IsMatch }
-
-            foreach ($match in $matchedQueries) {
-                $responseKey = "$($match.Name)|$($match.WantsUnicast)|$($match.QType)"
-                if (-not $responsesSent.Add($responseKey)) {
-                    continue
-                }
-
-                $responses = [System.Collections.Generic.List[object]]::new()
-
-                if ($match.QType -eq 0x0001) {
-                    $responses.Add([pscustomobject]@{ RecordType = 0x0001; AddressBytes = $IpBytes; Label = 'A' })
-                }
-                elseif ($match.QType -eq 0x001C) {
-                    if ($IPv6Bytes) {
-                        $responses.Add([pscustomobject]@{ RecordType = 0x001C; AddressBytes = $IPv6Bytes; Label = 'AAAA' })
-                    }
-                    else {
-                        Write-Verbose ("mDNS query requested AAAA but no IPv6 address is configured for {0}" -f $match.Name)
-                    }
-                }
-                else {
-                    # ANY query: return all available address families.
-                    $responses.Add([pscustomobject]@{ RecordType = 0x0001; AddressBytes = $IpBytes; Label = 'A' })
-                    if ($IPv6Bytes) {
-                        $responses.Add([pscustomobject]@{ RecordType = 0x001C; AddressBytes = $IPv6Bytes; Label = 'AAAA' })
-                    }
-                }
-
-                foreach ($resp in $responses) {
-                    $response = New-AnswerPacket -Name $match.Name -AddressBytes $resp.AddressBytes -RecordType $resp.RecordType
-
-                    if ($match.WantsUnicast) {
-                        $null = $UdpClient.Send($response, $response.Length, $remoteEndPoint)
-                        Write-Verbose ("mDNS response path=unicast target={0}:{1} name={2} type={3}" -f $remoteEndPoint.Address, $remoteEndPoint.Port, $match.Name, $resp.Label)
-                        Write-Host "  -> Responded (unicast $($resp.Label)) for: $($match.Name) to $($remoteEndPoint.Address):$($remoteEndPoint.Port)" -ForegroundColor DarkGray
-                    }
-                    else {
-                        $null = $UdpClient.Send($response, $response.Length, $EndPoint)
-                        Write-Verbose ("mDNS response path=multicast target={0}:{1} name={2} type={3}" -f $EndPoint.Address, $EndPoint.Port, $match.Name, $resp.Label)
-                        Write-Host "  -> Responded (multicast $($resp.Label)) for: $($match.Name)" -ForegroundColor DarkGray
-                    }
-                }
-            }
+            $queryPacketV4 = $UdpClient.Receive([ref]$remoteEndPointV4)
+            Handle-IncomingQueryPacket -Socket $UdpClient -QueryPacket $queryPacketV4 -RemoteEndPoint $remoteEndPointV4 -MulticastEndPoint $EndPoint -PublishedSet $PublishedNames -IPv4AddressBytes $IpBytes -IPv6AddressBytes $IPv6Bytes
         }
         catch [System.Net.Sockets.SocketException] {
             if ($_.Exception.SocketErrorCode -ne [System.Net.Sockets.SocketError]::TimedOut) {
                 throw
+            }
+        }
+
+        if ($UdpClientV6) {
+            try {
+                $queryPacketV6 = $UdpClientV6.Receive([ref]$remoteEndPointV6)
+                Handle-IncomingQueryPacket -Socket $UdpClientV6 -QueryPacket $queryPacketV6 -RemoteEndPoint $remoteEndPointV6 -MulticastEndPoint $EndPointV6 -PublishedSet $PublishedNames -IPv4AddressBytes $IpBytes -IPv6AddressBytes $IPv6Bytes
+            }
+            catch [System.Net.Sockets.SocketException] {
+                if ($_.Exception.SocketErrorCode -ne [System.Net.Sockets.SocketError]::TimedOut) {
+                    throw
+                }
             }
         }
     }
@@ -455,5 +513,8 @@ finally {
     }
 
     $UdpClient.Close()
+    if ($UdpClientV6) {
+        $UdpClientV6.Close()
+    }
     Write-Host "[!] Broadcast stopped. Socket closed." -ForegroundColor Red
 }
